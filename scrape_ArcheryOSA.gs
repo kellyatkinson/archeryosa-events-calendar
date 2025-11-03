@@ -5,22 +5,94 @@
 
 const CONFIG = {
   CAL_ID: PropertiesService.getScriptProperties().getProperty('CALENDAR_ID'),
-  BASE_URL: 'https://www.archeryosa.com'
+  BASE_URLS: [
+    'https://www.archeryosa.com',
+    'https://archeryosa.com'
+  ],
+  EVENT_LISTING_PATHS: ['/', '/events']
 };
 
+const DEFAULT_FETCH_OPTIONS = {
+  muteHttpExceptions: true,
+  followRedirects: true,
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (compatible; ArcheryOSAEventsBot/1.0; +https://script.google.com)'
+  }
+};
+
+const FETCH_RETRY_CONFIG = {
+  maxAttempts: 3,
+  initialDelayMs: 1000
+};
+
+function fetchWithRetry(url, options) {
+  const fetchOptions = Object.assign({}, DEFAULT_FETCH_OPTIONS, options || {});
+  let lastError = null;
+
+  for (let attempt = 0; attempt < FETCH_RETRY_CONFIG.maxAttempts; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, fetchOptions);
+      const statusCode = response.getResponseCode();
+
+      if (statusCode >= 200 && statusCode < 300) {
+        return response;
+      }
+
+      const snippet = response.getContentText().slice(0, 200);
+      lastError = new Error(`HTTP ${statusCode}: ${snippet}`);
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < FETCH_RETRY_CONFIG.maxAttempts - 1) {
+      const backoff = Math.pow(2, attempt) * FETCH_RETRY_CONFIG.initialDelayMs;
+      Utilities.sleep(backoff);
+    }
+  }
+
+  throw new Error(`Failed to fetch ${url}. ${lastError ? lastError.message : 'Unknown error'}`);
+}
+
+function fetchEventListingPage() {
+  const errors = [];
+
+  for (let i = 0; i < CONFIG.BASE_URLS.length; i++) {
+    const url = CONFIG.BASE_URLS[i];
+    for (let j = 0; j < CONFIG.EVENT_LISTING_PATHS.length; j++) {
+      const path = CONFIG.EVENT_LISTING_PATHS[j];
+      const fullUrl = url + path;
+
+      try {
+        const response = fetchWithRetry(fullUrl);
+        Logger.log(`Fetched event listing from ${fullUrl}`);
+        return { baseUrl: url, html: response.getContentText() };
+      } catch (error) {
+        const message = `${fullUrl}: ${error.message}`;
+        errors.push(message);
+        Logger.log(`Failed to fetch ${message}`);
+      }
+    }
+  }
+
+  throw new Error(`Unable to fetch event listing page. Attempts: ${errors.join('; ')}`);
+}
+
 function automateEventCreation() {
-  const mainPageUrl = CONFIG.BASE_URL;
-  const html = UrlFetchApp.fetch(mainPageUrl, ); // Fetch the main event listing page
-  
-  const events = parseEventData(html.getContentText()); // Parse the events from the table
-  
-  events.forEach(event => {
-    createOrUpdateCalendarEvent(event); // Create Google Calendar events for each
-  });
+  try {
+    const { baseUrl, html } = fetchEventListingPage();
+    const events = parseEventData(html, baseUrl); // Parse the events from the table
+
+    events.forEach(event => {
+      createOrUpdateCalendarEvent(event); // Create Google Calendar events for each
+    });
+  } catch (error) {
+    Logger.log(`automateEventCreation failed: ${error.message}`);
+    throw error;
+  }
 }
 
 function fetchEventDetails(eventUrl) {
-  const response = UrlFetchApp.fetch(eventUrl); // Fetch the event details page
+  const response = fetchWithRetry(eventUrl); // Fetch the event details page
   const html = response.getContentText();
 
   // Extract Start Date, End Date, and Host Club using regex
@@ -35,26 +107,38 @@ function fetchEventDetails(eventUrl) {
   return { startDate, endDate, hostClub };
 }
 
-function parseEventData(html) {
+function parseEventData(html, baseUrl) {
   const events = [];
-  
+
   // Regex to capture the event URL, name, date, region, and type from the main table
   const tableRowRegex = /<tr>\s*<th scope="row">\s*<a href="([^"]+)">\s*([^<]+)<\/a>\s*<\/th>\s*<td>([^<]+)<\/td>\s*<td>([^<]+)<\/td>\s*<td>([^<]+)<\/td>\s*<\/tr>/g;
   
   let match;
   while ((match = tableRowRegex.exec(html)) !== null) {
-    const eventUrl = CONFIG.BASE_URL + match[1];  // Full event URL
+    const eventHref = match[1];
+    const sanitizedBase = baseUrl.replace(/\/$/, '');
+    const normalizedPath = eventHref.startsWith('/') ? eventHref : `/${eventHref}`;
+    const eventUrl = eventHref.match(/^https?:\/\//i)
+      ? eventHref
+      : `${sanitizedBase}${normalizedPath}`;  // Full event URL
     const eventName = match[2].trim();  // Event name
     const eventDate = match[3].trim();  // Event start date (e.g., "16 Nov")
     const eventRegion = match[4].trim();  // Event region
     const eventType = match[5].trim();  // Event type
 
     // Fetch additional details from the event page
-    const details = fetchEventDetails(eventUrl);
+    let details = {};
+    try {
+      details = fetchEventDetails(eventUrl);
+    } catch (error) {
+      Logger.log(`Failed to fetch event details for ${eventUrl}: ${error.message}`);
+    }
     const startDate = details.startDate || eventDate;  // Use fetched start date if available
     const endDate = details.endDate || startDate;  // Use fetched end date if available
-    const hostClub = details.hostClub || '';  // Use fetched host club if available
-    if(hostClub == "Unknown Club") { const hostClub = ""};
+    let hostClub = details.hostClub || '';  // Use fetched host club if available
+    if (hostClub === 'Unknown Club') {
+      hostClub = '';
+    }
 
     // Push the event's details into the events array
     events.push({
@@ -96,7 +180,7 @@ function createOrUpdateCalendarEvent(event) {
   let eventTitle;
 
   // Modify event title based on the hostClub and event type
-  if (event.hostClub === "Unknown Club" || event.type === "League") {
+  if (!event.hostClub || event.type === "League") {
     eventTitle = `${event.name}`;  // No host club in the title if it's "Unknown Club" or "League"
   } else {
     // Remove "Archery Club" or "Archers" from the host club name if they exist
