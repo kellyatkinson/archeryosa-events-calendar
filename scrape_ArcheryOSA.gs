@@ -6,10 +6,10 @@
 const CONFIG = {
   CAL_ID: PropertiesService.getScriptProperties().getProperty('CALENDAR_ID'),
   BASE_URLS: [
-    'https://www.archeryosa.com',
-    'https://archeryosa.com'
+    'https://archeryosa.com',
+    'https://www.archeryosa.com'
   ],
-  EVENT_LISTING_PATHS: ['/', '/events']
+  EVENT_LISTING_PATHS: ['/events']
 };
 
 const DEFAULT_FETCH_OPTIONS = {
@@ -155,6 +155,101 @@ function parseEventData(html, baseUrl) {
   return events;
 }
 
+function normalizeKeyPart(value) {
+  return (value || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function generateEventKey(event, startDate) {
+  const timezone = Session.getScriptTimeZone() || 'Etc/GMT';
+  const normalizedDate = Utilities.formatDate(startDate, timezone, 'yyyy-MM-dd');
+  const normalizedHost = normalizeKeyPart(event.hostClub);
+  const normalizedRegion = normalizeKeyPart(event.region);
+  const normalizedType = normalizeKeyPart(event.type);
+
+  return [normalizedDate, normalizedHost, normalizedRegion, normalizedType].join('|');
+}
+
+function buildEventDescription(event, eventKey) {
+  return [
+    `Type: ${event.type}`,
+    `Event URL: ${event.url}`,
+    `Host Club: ${event.hostClub}`,
+    `Region: ${event.region}`,
+    `Event Key: ${eventKey}`
+  ].join('\n');
+}
+
+function extractDescriptionMetadata(description) {
+  const metadata = {};
+
+  if (!description) {
+    return metadata;
+  }
+
+  const lines = description.split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const separatorIndex = line.indexOf(':');
+
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const key = line.slice(0, separatorIndex).trim();
+    const value = line.slice(separatorIndex + 1).trim();
+
+    if (key) {
+      metadata[key] = value;
+    }
+  }
+
+  return metadata;
+}
+
+function findExistingCalendarEvent(calendar, startDate, event, eventKey) {
+  const eventsOnDay = calendar.getEventsForDay(startDate);
+  const normalizedHost = normalizeKeyPart(event.hostClub);
+  const normalizedRegion = normalizeKeyPart(event.region);
+  const normalizedType = normalizeKeyPart(event.type);
+
+  for (let i = 0; i < eventsOnDay.length; i++) {
+    const candidate = eventsOnDay[i];
+    const description = candidate.getDescription() || '';
+    const metadata = extractDescriptionMetadata(description);
+
+    if (metadata['Event Key'] === eventKey) {
+      return candidate;
+    }
+
+    if (metadata['Event URL'] === event.url) {
+      return candidate;
+    }
+
+    const metadataHost = normalizeKeyPart(metadata['Host Club']);
+    const metadataRegion = normalizeKeyPart(metadata['Region']);
+    const metadataType = normalizeKeyPart(metadata['Type']);
+
+    const hostMatches = normalizedHost && metadataHost === normalizedHost;
+    const regionMatches = normalizedRegion && metadataRegion === normalizedRegion;
+    const typeMatches = normalizedType && metadataType === normalizedType;
+
+    // Require at least two matching attributes to avoid false positives.
+    if (
+      (hostMatches && regionMatches) ||
+      (hostMatches && typeMatches) ||
+      (regionMatches && typeMatches)
+    ) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function createOrUpdateCalendarEvent(event) {
   const calendar = CalendarApp.getCalendarById(CONFIG.CAL_ID);
   
@@ -173,9 +268,9 @@ function createOrUpdateCalendarEvent(event) {
   // startDate.setHours(0, 0, 0, 0); // Reset to midnight to ensure it's an all-day event
   // endDate.setHours(0, 0, 0, 0);   // Reset to midnight for the same reason
 
-  // Search for existing events on the same day with the same event URL in the description
-  const existingEvents = calendar.getEventsForDay(startDate)
-    .filter(e => e.getDescription().includes(event.url));
+  const eventKey = generateEventKey(event, startDate);
+  const eventDescription = buildEventDescription(event, eventKey);
+  const existingEvent = findExistingCalendarEvent(calendar, startDate, event, eventKey);
 
   let eventTitle;
 
@@ -201,14 +296,14 @@ function createOrUpdateCalendarEvent(event) {
     }
   }
 
-  if (existingEvents.length > 0) {
+  const eventLocation = event.hostClub || '';
+
+  if (existingEvent) {
     // Update the existing event
-    const existingEvent = existingEvents[0]; // Assuming there is only one event for the URL
-    
     // Check if any details have changed
-    const descriptionChanged = existingEvent.getDescription() !== `Type: ${event.type}\nEvent URL: ${event.url}\nHost Club: ${event.hostClub}\nRegion: ${event.region}`;
+    const descriptionChanged = existingEvent.getDescription() !== eventDescription;
     const titleChanged = existingEvent.getTitle() !== eventTitle;
-    const locationChanged = existingEvent.getLocation() !== event.hostClub;
+    const locationChanged = (existingEvent.getLocation() || '') !== eventLocation;
     const startTimeChanged = existingEvent.getStartTime().getTime() !== startDate.getTime();
     const endTimeChanged = existingEvent.getEndTime().getTime() !== endDate.getTime();
 
@@ -217,8 +312,8 @@ function createOrUpdateCalendarEvent(event) {
       Logger.log(`Updating event: ${eventTitle}`);
       
       existingEvent.setTitle(eventTitle);
-      existingEvent.setLocation(event.hostClub);
-      existingEvent.setDescription(`Type: ${event.type}\nEvent URL: ${event.url}\nHost Club: ${event.hostClub}\nRegion: ${event.region}`);
+      existingEvent.setLocation(eventLocation);
+      existingEvent.setDescription(eventDescription);
       existingEvent.setTime(startDate, endDate); // Update time (still all-day)
     } else {
       Logger.log(`Event with URL "${event.url}" already exists and is up-to-date.`);
@@ -228,8 +323,8 @@ function createOrUpdateCalendarEvent(event) {
     Logger.log(`Creating new event: ${eventTitle}`);
     
     calendar.createAllDayEvent(eventTitle, startDate, endDate, {
-      location: event.hostClub,
-      description: `Type: ${event.type}\nEvent URL: ${event.url}\nHost Club: ${event.hostClub}\nRegion: ${event.region}`
+      location: eventLocation,
+      description: eventDescription
     });
   }
   
